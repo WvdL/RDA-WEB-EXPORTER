@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>RDA File Extractor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+    <style>
+        .error {
+            color: #DC2626;
+        }
+        #log {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+    </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-gray-100 to-gray-200 flex items-center justify-center p-4">
+
+<div class="w-full max-w-xl bg-white rounded-lg shadow-md p-6 space-y-4">
+    <h2 class="text-2xl font-bold text-gray-700 text-center">
+        RDA File Extractor
+    </h2>
+
+    <div>
+        <label
+                for="fileInput"
+                class="block mb-1 font-medium text-gray-700"
+        >
+            Select an RDA file:
+        </label>
+        <input
+                type="file"
+                id="fileInput"
+                accept=".rda"
+                class="block w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+        />
+    </div>
+
+    <div id="progress" class="text-gray-600"></div>
+
+    <div id="fileList" class="text-sm"></div>
+
+    <div class="bg-gray-100 p-3 rounded-md">
+        <pre id="log" class="font-mono text-sm leading-5"></pre>
+    </div>
+</div>
+
+<script>
+    /**
+     * Enumeration for RDA file versions.
+     */
+    const VERSION = {
+        INVALID: 0,
+        VERSION_2_0: 1,
+        VERSION_2_2: 2
+    };
+
+    /**
+     * Flags indicating various properties (compression, encryption, etc.).
+     */
+    const FLAGS = {
+        NONE: 0,
+        COMPRESSED: 1,
+        ENCRYPTED: 2,
+        MEMORY_RESIDENT: 4,
+        DELETED: 8
+    };
+
+    /**
+     * Known magic strings that identify RDA versions.
+     */
+    const MAGIC_STRINGS = {
+        [VERSION.VERSION_2_0]: "Resource File V2.0",
+        [VERSION.VERSION_2_2]: "Resource File V2.2"
+    };
+
+    /**
+     * Sizes for different RDA file versions.
+     */
+    const FILE_SIZES = {
+        [VERSION.VERSION_2_0]: {
+            UNKNOWN_SIZE: 1008,
+            UINT_SIZE: 4,
+            DIR_ENTRY_SIZE: 540,
+            FILENAME_SIZE: 520
+        },
+        [VERSION.VERSION_2_2]: {
+            UNKNOWN_SIZE: 766,
+            UINT_SIZE: 8,
+            DIR_ENTRY_SIZE: 560,
+            FILENAME_SIZE: 520
+        }
+    };
+
+    /**
+     * Appends a log message to the #log element.
+     * @param {string} msg - The message to log.
+     * @param {boolean} [error=false] - Whether this message represents an error.
+     */
+    function log(msg, error = false) {
+        const logElem = document.getElementById('log');
+        logElem.innerHTML += `${error ? '<span class="error">' : ''}${msg}${error ? '</span>' : ''}\n`;
+    }
+
+    /**
+     * Reads a null-terminated Unicode string (UTF-16LE) from a DataView.
+     * @param {DataView} dataView - The DataView to read from.
+     * @param {number} offset - The byte offset in the DataView.
+     * @param {number} maxLength - The maximum length of the string in bytes.
+     * @returns {string} - The extracted string.
+     */
+    function readUnicodeString(dataView, offset, maxLength) {
+        const chars = [];
+        for (let i = 0; i < maxLength; i += 2) {
+            const charCode = dataView.getUint16(offset + i, true);
+            if (charCode === 0) break;
+            chars.push(String.fromCharCode(charCode));
+        }
+        return chars.join('');
+    }
+
+    /**
+     * Reads a null-terminated UTF-8 string from a DataView.
+     * @param {DataView} dataView - The DataView to read from.
+     * @param {number} offset - The byte offset in the DataView.
+     * @param {number} maxLength - The maximum length of the string in bytes.
+     * @returns {string} - The extracted string.
+     */
+    function readUTF8String(dataView, offset, maxLength) {
+        const bytes = new Uint8Array(dataView.buffer, offset, maxLength);
+        const nullIndex = bytes.indexOf(0);
+        const validBytes = nullIndex !== -1 ? bytes.slice(0, nullIndex) : bytes;
+        return new TextDecoder('utf-8').decode(validBytes);
+    }
+
+    /**
+     * Decrypts the given ArrayBuffer using a specific seed.
+     * @param {ArrayBuffer} buffer - The data to decrypt.
+     * @param {number} seed - The decryption seed.
+     * @returns {ArrayBuffer} - The decrypted data.
+     */
+    function decrypt(buffer, seed) {
+        if (buffer.byteLength === 0) return buffer;
+        if (seed === 0) throw new Error("Invalid decryption seed");
+
+        const dataView = new DataView(buffer);
+        const shorts = [];
+        for (let i = 0; i < Math.floor(buffer.byteLength / 2); i++) {
+            shorts.push(dataView.getInt16(i * 2, true));
+        }
+
+        const result = new ArrayBuffer(buffer.byteLength);
+        const resultView = new DataView(result);
+        let num1 = BigInt(seed);
+        const mask = BigInt(0xFFFFFFFF);
+
+        for (let i = 0; i < shorts.length; i++) {
+            num1 = ((num1 * BigInt(214013) + BigInt(2531011)) & mask);
+            const num2 = Number((num1 >> BigInt(16)) & BigInt(0x7FFF));
+            const num3 = shorts[i] ^ num2;
+            resultView.setInt16(i * 2, num3, true);
+        }
+
+        // If the original length was odd, copy the last byte as-is.
+        if (buffer.byteLength % 2 !== 0) {
+            resultView.setUint8(buffer.byteLength - 1, dataView.getUint8(buffer.byteLength - 1));
+        }
+
+        return result;
+    }
+
+    /**
+     * Retrieves the decryption seed for a given RDA file version.
+     * @param {number} version - The file version.
+     * @returns {number} - The appropriate decryption seed.
+     */
+    function getDecryptionSeed(version) {
+        switch (version) {
+            case VERSION.VERSION_2_0:
+                return 0xA2C2A;
+            case VERSION.VERSION_2_2:
+                return 0x71C71C71;
+            default:
+                throw new Error(`Invalid version ${version} for decryption`);
+        }
+    }
+
+    /**
+     * Reads and validates the RDA file header to determine version and offsets.
+     * @param {File} file - The RDA file.
+     * @returns {Promise<Object>} - The header info (version, encoding, firstBlockOffset, etc).
+     */
+    async function readFileHeader(file) {
+        const header = { size: 0 };
+        // Read the first 2 bytes to identify if it's "R\0" (UTF-16) or "Re" (UTF-8).
+        const firstBytes = new Uint8Array(await file.slice(0, 2).arrayBuffer());
+
+        if (firstBytes[0] === 0x52 && firstBytes[1] === 0x00) {
+            header.version = VERSION.VERSION_2_0;
+            header.encoding = 'utf-16le';
+        } else if (firstBytes[0] === 0x52 && firstBytes[1] === 0x65) {
+            header.version = VERSION.VERSION_2_2;
+            header.encoding = 'utf-8';
+        } else {
+            throw new Error("Invalid RDA file format");
+        }
+
+        const magicString = MAGIC_STRINGS[header.version];
+        const encoder = new TextEncoder();
+        // The magic string length differs if it's UTF-16 or UTF-8
+        header.magicSize = header.version === VERSION.VERSION_2_0
+            ? magicString.length * 2
+            : encoder.encode(magicString).length;
+
+        header.unknownSize = FILE_SIZES[header.version].UNKNOWN_SIZE;
+        header.uintSize = FILE_SIZES[header.version].UINT_SIZE;
+        header.size = header.magicSize + header.unknownSize + header.uintSize;
+
+        const headerBuffer = await file.slice(0, header.size).arrayBuffer();
+        const view = new DataView(headerBuffer);
+        const magicBytes = new Uint8Array(headerBuffer, 0, header.magicSize);
+        const decoder = new TextDecoder(header.encoding);
+        const magic = decoder.decode(magicBytes).replace(/\0+$/, '');
+
+        if (magic !== magicString) {
+            throw new Error("Invalid magic string");
+        }
+
+        const offsetPos = header.magicSize + header.unknownSize;
+        header.firstBlockOffset = header.version === VERSION.VERSION_2_0
+            ? view.getUint32(offsetPos, true)
+            : Number(view.getBigUint64(offsetPos, true));
+
+        return header;
+    }
+
+    /**
+     * Reads information about an individual block in the RDA file.
+     * @param {File} file - The RDA file.
+     * @param {number} offset - The offset to the block info structure.
+     * @param {number} version - The RDA file version.
+     * @returns {Promise<Object>} - An object containing block info.
+     */
+    async function readBlockInfo(file, offset, version) {
+        const blockSize = version === VERSION.VERSION_2_0 ? 20 : 32;
+        const buffer = await file.slice(offset, offset + blockSize).arrayBuffer();
+        const view = new DataView(buffer);
+
+        return {
+            flags: view.getUint32(0, true),
+            fileCount: view.getUint32(4, true),
+            directorySize: version === VERSION.VERSION_2_0
+                ? view.getUint32(8, true)
+                : Number(view.getBigUint64(8, true)),
+            decompressedSize: version === VERSION.VERSION_2_0
+                ? view.getUint32(12, true)
+                : Number(view.getBigUint64(16, true)),
+            nextBlock: version === VERSION.VERSION_2_0
+                ? view.getUint32(16, true)
+                : Number(view.getBigUint64(24, true))
+        };
+    }
+
+    /**
+     * Reads and decompresses a memory-resident directory block if applicable.
+     * @param {File} file - The RDA file.
+     * @param {number} offset - The starting offset of the block data.
+     * @param {number} size - The compressed block size.
+     * @param {number} compressed - The uncompressed size (not always used directly).
+     * @param {Object} blockInfo - Flags and other block properties.
+     * @param {number} version - RDA file version.
+     * @returns {Promise<Uint8Array>} - The uncompressed directory block data.
+     */
+    async function readMemoryResidentBlock(file, offset, size, compressed, blockInfo, version) {
+        const buffer = await file.slice(offset, offset + size).arrayBuffer();
+        let data = new Uint8Array(buffer);
+
+        if ((blockInfo.flags & FLAGS.ENCRYPTED) === FLAGS.ENCRYPTED) {
+            data = new Uint8Array(decrypt(data.buffer, getDecryptionSeed(version)));
+        }
+
+        if ((blockInfo.flags & FLAGS.COMPRESSED) === FLAGS.COMPRESSED) {
+            data = pako.inflate(data);
+        }
+
+        return data;
+    }
+
+    /**
+     * Reads a single directory entry from the directory block.
+     * @param {DataView} dataView - The directory data.
+     * @param {number} offset - The offset within the directory data.
+     * @param {number} version - RDA file version.
+     * @returns {Object} - An object with filename, offsets, size, etc.
+     */
+    function readDirEntry(dataView, offset, version) {
+        const sizes = FILE_SIZES[version];
+        const entry = {};
+
+        entry.filename = readUnicodeString(dataView, offset, sizes.FILENAME_SIZE);
+        offset += sizes.FILENAME_SIZE;
+
+        if (version === VERSION.VERSION_2_0) {
+            entry.offset = dataView.getUint32(offset, true);
+            entry.compressed = dataView.getUint32(offset + 4, true);
+            entry.filesize = dataView.getUint32(offset + 8, true);
+            entry.timestamp = dataView.getUint32(offset + 12, true);
+            entry.unknown = dataView.getUint32(offset + 16, true);
+        } else {
+            entry.offset = Number(dataView.getBigUint64(offset, true));
+            entry.compressed = Number(dataView.getBigUint64(offset + 8, true));
+            entry.filesize = Number(dataView.getBigUint64(offset + 16, true));
+            entry.timestamp = Number(dataView.getBigUint64(offset + 24, true));
+            entry.unknown = Number(dataView.getBigUint64(offset + 32, true));
+        }
+
+        return entry;
+    }
+
+    /**
+     * Converts a Unix timestamp to a JavaScript Date object.
+     * @param {number} timestamp - Unix timestamp in seconds.
+     * @returns {Date} - The corresponding Date object.
+     */
+    function fromTimeStamp(timestamp) {
+        return new Date(timestamp * 1000);
+    }
+
+    /**
+     * Extracts an individual file from the RDA, handling decryption and decompression.
+     * @param {File} file - The RDA file.
+     * @param {Object} fileEntry - An object containing offset, compressed size, flags.
+     * @param {number} version - RDA file version.
+     * @returns {Promise<Uint8Array>} - The raw (decompressed/decrypted) file data.
+     */
+    async function extractFile(file, fileEntry, version) {
+        const buffer = await file.slice(fileEntry.offset, fileEntry.offset + fileEntry.compressedSize).arrayBuffer();
+        let data = new Uint8Array(buffer);
+
+        if ((fileEntry.flags & FLAGS.ENCRYPTED) === FLAGS.ENCRYPTED) {
+            data = new Uint8Array(decrypt(data.buffer, getDecryptionSeed(version)));
+        }
+
+        if ((fileEntry.flags & FLAGS.COMPRESSED) === FLAGS.COMPRESSED) {
+            data = pako.inflate(data);
+        }
+
+        return data;
+    }
+
+    /**
+     * Main function to extract all files from an RDA file and pack them into a ZIP.
+     * @param {File} file - The RDA file to process.
+     */
+    async function extractRDAFile(file) {
+        try {
+            log(`Processing ${file.name}...`);
+            const header = await readFileHeader(file);
+            log(`Detected version: ${header.version === VERSION.VERSION_2_0 ? '2.0' : '2.2'}`);
+
+            const zip = new JSZip();
+            let currentBlock = header.firstBlockOffset;
+            let blockCount = 0;
+            let skippedBlocks = 0;
+
+            while (currentBlock < file.size) {
+                const blockInfo = await readBlockInfo(file, currentBlock, header.version);
+                blockCount++;
+
+                if ((blockInfo.flags & FLAGS.DELETED) !== FLAGS.DELETED) {
+                    try {
+                        const dirOffset = currentBlock - blockInfo.directorySize;
+                        let dirData;
+
+                        // If it's memory-resident, read from the memory-resident block
+                        if ((blockInfo.flags & FLAGS.MEMORY_RESIDENT) === FLAGS.MEMORY_RESIDENT) {
+                            const mrOffset = dirOffset - (header.uintSize * 2);
+                            const mrView = new DataView(await file.slice(mrOffset, dirOffset).arrayBuffer());
+
+                            // The next two values represent compressed and uncompressed sizes
+                            const mrCompressed = header.version === VERSION.VERSION_2_0
+                                ? mrView.getUint32(0, true)
+                                : Number(mrView.getBigUint64(0, true));
+                            const mrUncompressed = header.version === VERSION.VERSION_2_0
+                                ? mrView.getUint32(4, true)
+                                : Number(mrView.getBigUint64(8, true));
+
+                            // Read the memory-resident block
+                            dirData = await readMemoryResidentBlock(
+                                file,
+                                mrOffset - mrCompressed,
+                                mrCompressed,
+                                mrUncompressed,
+                                blockInfo,
+                                header.version
+                            );
+                        } else {
+                            // Read the raw directory data for the block
+                            let rawDirData = new Uint8Array(
+                                await file.slice(dirOffset, currentBlock).arrayBuffer()
+                            );
+
+                            // Decrypt if necessary
+                            if ((blockInfo.flags & FLAGS.ENCRYPTED) === FLAGS.ENCRYPTED) {
+                                rawDirData = new Uint8Array(
+                                    decrypt(rawDirData.buffer, getDecryptionSeed(header.version))
+                                );
+                            }
+
+                            // Decompress if necessary
+                            if ((blockInfo.flags & FLAGS.COMPRESSED) === FLAGS.COMPRESSED) {
+                                rawDirData = pako.inflate(rawDirData);
+                            }
+
+                            dirData = rawDirData;
+                        }
+
+                        const dirView = new DataView(dirData.buffer);
+                        const entrySize = FILE_SIZES[header.version].DIR_ENTRY_SIZE;
+
+                        for (let i = 0; i < blockInfo.fileCount; i++) {
+                            const entry = readDirEntry(dirView, i * entrySize, header.version);
+
+                            const extractedData = await extractFile(
+                                file,
+                                {
+                                    offset: entry.offset,
+                                    compressedSize: entry.compressed,
+                                    flags: blockInfo.flags
+                                },
+                                header.version
+                            );
+                            zip.file(entry.filename, extractedData);
+                            log(`Added ${entry.filename} to ZIP`);
+                        }
+                    } catch (err) {
+                        log(`Warning: Skipping block at ${currentBlock} - ${err.message}`, true);
+                        skippedBlocks++;
+                    }
+                }
+                // Stop if no next block is defined or if it's not valid
+                if (blockInfo.nextBlock === 0 || blockInfo.nextBlock <= currentBlock) {
+                    break;
+                }
+                currentBlock = blockInfo.nextBlock;
+            }
+
+            log(`Processed ${blockCount} blocks (${skippedBlocks} skipped)`);
+            log(`Creating ZIP file...`);
+
+            // Generate the ZIP and trigger download
+            const content = await zip.generateAsync({ type: "blob" });
+            const url = URL.createObjectURL(content);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = file.name.replace('.rda', '.zip');
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            log(`ZIP file created and downloaded!`);
+        } catch (err) {
+            log(`Error: ${err.message}`, true);
+            throw err;
+        }
+    }
+
+    /**
+     * Initializes the UI and sets up file input change handling.
+     */
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        document.getElementById('log').innerHTML = '';
+
+        try {
+            await extractRDAFile(file);
+        } catch (err) {
+            log(`Fatal error: ${err.message}`, true);
+        }
+    });
+</script>
+</body>
+</html>
