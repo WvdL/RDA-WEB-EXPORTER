@@ -2,6 +2,9 @@
 
 A **single-page HTML/JavaScript** (partial) port of the [RDAExplorer](https://github.com/lysanntranvouez/RDAExplorer) application, intended to read and export data from RDA files. The original RDAExplorer is a Windows application that can read and save the RDA file format used in Anno 1404, 2070, 2205, and 1800.
 
+
+![img.png](img.png)
+
 ## Why I Made This
 
 I only tested this for **Anno 1404 History Edition**, running on **Wine on macOS**.  
