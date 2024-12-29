@@ -27,6 +27,47 @@ This single-page web exporter was primarily created to suit my personal use case
 
 ---
 
+## Technical Details
+
+### Decryption Process
+
+The RDA format uses a symmetric encryption scheme based on Microsoft's C Runtime Library random number generator - a Linear Congruential Generator (LCG) using the exact constants from msvcrt.dll's rand() implementation (multiplier: 214013, increment: 2531011). Likely chosen for its simplicity and speed rather than security. Here's how the decryption process works:
+
+```mermaid
+flowchart TD
+  Start([Start Decryption]) --> CheckEmpty{Check Empty Buffer}
+  CheckEmpty -->|Empty| ReturnEmpty[Return Empty Buffer]
+  CheckEmpty -->|Not Empty| CheckSeed{Check Valid Seed}
+
+  CheckSeed -->|Invalid| ThrowError[Throw Error]
+  CheckSeed -->|Valid| Convert["Convert to Int16 Array<br>using DataView"]
+
+  Convert --> InitVars["Initialize:<br>num1 = BigInt&#40;seed&#41;<br>mask = BigInt&#40;0xFFFFFFFF&#41; // 32-bit mask"]
+  InitVars --> DecLoop{"For each 16-bit chunk"}
+
+  DecLoop --> CalcKey["Generate Key using MS rand() constants:<br>num1 = &#40;num1 * 214013 + 2531011&#41; &amp; mask<br>num2 = Number&#40;&#40;num1 &gt;&gt; 16&#41; &amp; 0x7FFF&#41; // MS rand() behavior"]
+  CalcKey --> XorOp["Decrypt chunk:<br>num3 = chunk ⊕ num2"]
+  XorOp --> Store["Store Int16 Result"]
+  Store --> DecLoop
+
+  DecLoop -->|Complete| CheckOdd{"Odd Length?"}
+  CheckOdd -->|Yes| CopyLast["Copy Last Byte As-Is"]
+  CheckOdd -->|No| Final["Return Decrypted Buffer"]
+  CopyLast --> Final
+
+  Final --> End([End Decryption])
+
+  classDef process fill:#a8d5ff,stroke:#333,stroke-width:2px
+  classDef decision fill:#ffe6a8,stroke:#333,stroke-width:2px
+  classDef crypto fill:#ffc9c9,stroke:#333,stroke-width:2px
+  classDef error fill:#ffcccb,stroke:#333,stroke-width:2px
+
+  class Convert,InitVars,CalcKey,XorOp,Store,Final process
+  class CheckEmpty,CheckSeed,CheckOdd,DecLoop decision
+  class ThrowError error
+  class ReturnEmpty crypto
+   ```
+
 ## Usage
 
 1. **Download** the `RDA-WEB-EXPORTER.html` file.
